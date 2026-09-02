@@ -1,6 +1,6 @@
-name: Build dataset from ClinicalTrials.gov
+name: Build datasets from ClinicalTrials.gov and PubMed
 
-# Runs the full platform on GitHub's own runners, so the real registry data and
+# Runs the full platform on GitHub's own runners, so the real source APIs and
 # the real embedding models can be exercised without installing anything locally.
 # Trigger it from the Actions tab: "Run workflow".
 on:
@@ -11,11 +11,15 @@ on:
         required: false
         default: "type 2 diabetes"
       target_records:
-        description: "How many trials to pull"
+        description: "How many trials to pull from ClinicalTrials.gov"
         required: false
         default: "60"
+      literature_records:
+        description: "How many articles to pull from PubMed"
+        required: false
+        default: "30"
       commit_dataset:
-        description: "Commit the downloaded raw dataset back to the repository"
+        description: "Commit the downloaded raw datasets back to the repository"
         type: boolean
         required: false
         default: true
@@ -50,23 +54,27 @@ jobs:
           python --version
           pip list | grep -Ei "torch|sentence-transformers|chromadb|pandas|httpx|rank-bm25" || true
 
-      - name: Run the pipeline against the live registry
+      - name: Run the pipeline against the live sources
         env:
           CTGOV_CONDITION: ${{ inputs.condition }}
           CTGOV_TARGET_RECORDS: ${{ inputs.target_records }}
+          PUBMED_TARGET_RECORDS: ${{ inputs.literature_records }}
         run: |
           set -o pipefail
           python clinical_trial_rag.py --stage pipeline 2>&1 | tee run-pipeline.txt
 
-      - name: Confirm the data came from the live registry
+      - name: Confirm both sources came from live APIs
         run: |
-          if grep -q "Ingestion mode = LIVE" run-pipeline.txt; then
-            echo "Live registry ingestion confirmed."
-          else
-            echo "::error::Ingestion did not run in LIVE mode - the registry was not reached."
-            grep -i "Ingestion mode" run-pipeline.txt || true
+          grep -i "Ingestion mode" run-pipeline.txt || true
+          if ! grep -q "ClinicalTrials.gov] Ingestion mode = LIVE" run-pipeline.txt; then
+            echo "::error::ClinicalTrials.gov did not run in LIVE mode."
             exit 1
           fi
+          if ! grep -q "PubMed] Ingestion mode = LIVE" run-pipeline.txt; then
+            echo "::error::PubMed did not run in LIVE mode."
+            exit 1
+          fi
+          echo "Both sources confirmed live."
 
       - name: Confirm the real embedding model loaded
         run: |
@@ -101,7 +109,7 @@ jobs:
             echo "## Pipeline run"
             echo ""
             echo '```'
-            grep -E "Ingestion mode|SUCCESS  \| Task|clean_records|rejected_records|CHUNK\+EMBED|VECTOR INDEX" run-pipeline.txt || true
+            grep -E "Ingestion mode|SUCCESS  \| Task|QUALITY\]|FHIR\]|LAKEHOUSE\]|CHUNK\+EMBED|VECTOR INDEX" run-pipeline.txt || true
             echo '```'
             echo ""
             echo "## Lakehouse versions"
@@ -132,16 +140,16 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f data/landing_zone/ctgov_raw.json
+          git add -f data/landing_zone/ctgov_raw.json data/landing_zone/pubmed_raw.xml
           if git diff --cached --quiet; then
             echo "Dataset unchanged - nothing to commit."
           else
             RECORDS=$(python -c "import json;print(len(json.load(open('data/landing_zone/ctgov_raw.json'))))")
-            git commit -m "Add real ClinicalTrials.gov dataset (${RECORDS} studies, condition: ${{ inputs.condition }})
+            git commit -m "Refresh source datasets (${RECORDS} studies, condition: ${{ inputs.condition }})
 
-          Downloaded from the ClinicalTrials.gov API v2 by the build-dataset
-          workflow. This is the untouched registry response, kept under version
-          control so the whole pipeline can be replayed offline with
-          --stage pipeline --offline."
+          Downloaded from the ClinicalTrials.gov API v2 and the PubMed
+          E-utilities API by the build-dataset workflow. These are the untouched
+          source responses, kept under version control so the whole pipeline can
+          be replayed offline with --stage pipeline --offline."
             git push
           fi

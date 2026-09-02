@@ -68,7 +68,8 @@ import hashlib
 import asyncio
 import argparse
 import datetime as dt
-from typing import Any, Iterable
+import xml.etree.ElementTree as ET
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -98,21 +99,32 @@ class Settings:
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
         self.openrouter_model = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-coder:free")
         self.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-        self.embed_model_name = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+        # A biomedical embedding model: clinical language ("HbA1c", "eGFR",
+        # "albuminuria") sits outside a general model's training distribution.
+        # See BIOMEDICAL_EMBEDDING_NOTE below for why this rather than raw
+        # ClinicalBERT.
+        self.embed_model_name = os.getenv("EMBED_MODEL_NAME", "NeuML/pubmedbert-base-embeddings")
         self.rerank_model_name = os.getenv("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-        # --- Source system -----------------------------------------------------
-        # Overridable so the ingestion path can be pointed at a registry mirror
-        # or at a local fixture server during testing.
+        # --- Source systems ----------------------------------------------------
+        # Both are overridable so ingestion can be pointed at a mirror or at a
+        # local fixture server during testing.
         self.ctgov_api = os.getenv("CTGOV_API_URL", "https://clinicaltrials.gov/api/v2/studies")
         self.ctgov_condition = os.getenv("CTGOV_CONDITION", "type 2 diabetes")
         self.ctgov_target_records = int(os.getenv("CTGOV_TARGET_RECORDS", "60"))
         self.ctgov_page_size = 50
 
+        # PubMed, via the NCBI E-utilities API. Free, public, no key required
+        # (a key only raises the rate limit).
+        self.pubmed_api = os.getenv("PUBMED_API_URL", "https://eutils.ncbi.nlm.nih.gov/entrez/eutils")
+        self.pubmed_query = os.getenv("PUBMED_QUERY", "")     # falls back to the condition
+        self.pubmed_target_records = int(os.getenv("PUBMED_TARGET_RECORDS", "30"))
+
         # --- Storage paths (the local "cloud object storage") ------------------
         self.landing_zone = "data/landing_zone"
         self.quarantine_zone = "data/quarantine_zone"
         self.lakehouse_path = "data/lakehouse/clinical_trials"
+        self.literature_lakehouse_path = "data/lakehouse/literature"
         self.governance_dir = "data/governance"
         self.chroma_db_dir = os.getenv("CHROMA_DB_DIR", "data/chroma_db")
 
@@ -127,12 +139,27 @@ class Settings:
     def as_dict(self) -> dict[str, Any]:
         return {
             "condition": self.ctgov_condition,
-            "target_records": self.ctgov_target_records,
+            "trials_target": self.ctgov_target_records,
+            "literature_target": self.pubmed_target_records,
             "embed_model": self.embed_model_name,
             "rerank_model": self.rerank_model_name,
             "llm_model": self.openrouter_model,
             "llm_configured": bool(self.openrouter_api_key),
         }
+
+
+# Why a PubMedBERT sentence-embedding model rather than ClinicalBERT itself:
+# ClinicalBERT is a masked-language-model checkpoint. Its raw [CLS] output was
+# never trained so that semantically similar sentences land near each other, so
+# using it directly for similarity search gives noticeably worse retrieval than
+# a general model that *was* trained for it. The model below is built on
+# PubMedBERT and then fine-tuned for sentence embeddings, so it keeps the
+# biomedical vocabulary while producing a vector space where cosine distance
+# actually means semantic distance. Set EMBED_MODEL_NAME to swap it.
+BIOMEDICAL_EMBEDDING_NOTE = (
+    "Biomedical sentence embeddings (PubMedBERT-based). Raw ClinicalBERT is an "
+    "MLM checkpoint and is not trained for similarity search."
+)
 
 
 settings = Settings()
@@ -158,6 +185,16 @@ DATA_CLASSIFICATION: dict[str, str] = {
     "sex": "PUBLIC",
     "enrollment": "PUBLIC",
     "last_update": "PUBLIC",
+    # PubMed literature fields - also a public database.
+    "pmid": "PUBLIC",
+    "title": "PUBLIC",
+    "abstract": "PUBLIC",
+    "journal": "PUBLIC",
+    "pub_year": "PUBLIC",
+    "authors": "PUBLIC",
+    "publication_types": "PUBLIC",
+    "doi": "PUBLIC",
+    "source_url": "PUBLIC",
     # Internal EHR fields - PHI under HIPAA, must never leave the safe zone.
     "patient_name": "RESTRICTED",
     "medical_record_number": "RESTRICTED",
@@ -167,6 +204,7 @@ DATA_CLASSIFICATION: dict[str, str] = {
     "address": "RESTRICTED",
     # De-identified clinical facts - usable for matching.
     "patient_pseudonym": "INTERNAL",
+    "gender": "INTERNAL",
     "age_years": "INTERNAL",
     "diagnosis": "INTERNAL",
     "hba1c": "INTERNAL",
@@ -216,6 +254,7 @@ class MockEventBroker:
     def __init__(self) -> None:
         self.topics: dict[str, asyncio.Queue] = {
             "raw_clinical_trials": asyncio.Queue(),
+            "raw_literature": asyncio.Queue(),
             "raw_patient_records": asyncio.Queue(),
             "validated_records": asyncio.Queue(),
         }
@@ -475,6 +514,231 @@ class ClinicalTrialsProducer:
         return len(studies)
 
 
+def flatten_pubmed_article(article: "ET.Element") -> dict[str, Any]:
+    """Maps a PubMed EFetch <PubmedArticle> element into a flat record.
+
+    Abstracts are frequently structured (BACKGROUND / METHODS / RESULTS), so the
+    labelled sections are reassembled in order rather than concatenated blindly -
+    a chunk that says "RESULTS: HbA1c fell by 1.2%" is far more useful to a
+    retriever than the same sentence stripped of its section.
+    """
+    def text_of(path: str, root=article) -> str | None:
+        node = root.find(path)
+        return "".join(node.itertext()).strip() if node is not None else None
+
+    pmid = text_of(".//MedlineCitation/PMID")
+
+    abstract_parts: list[str] = []
+    for node in article.findall(".//Abstract/AbstractText"):
+        label = node.get("Label")
+        body = "".join(node.itertext()).strip()
+        if body:
+            abstract_parts.append(f"{label}: {body}" if label else body)
+
+    authors = []
+    for node in article.findall(".//AuthorList/Author")[:6]:
+        last, initials = text_of("LastName", node), text_of("Initials", node)
+        if last:
+            authors.append(f"{last} {initials}" if initials else last)
+
+    year = (
+        text_of(".//JournalIssue/PubDate/Year")
+        or (text_of(".//JournalIssue/PubDate/MedlineDate") or "")[:4]
+        or None
+    )
+
+    doi = None
+    for node in article.findall(".//ArticleIdList/ArticleId"):
+        if node.get("IdType") == "doi":
+            doi = "".join(node.itertext()).strip()
+
+    pub_types = [
+        "".join(n.itertext()).strip()
+        for n in article.findall(".//PublicationTypeList/PublicationType")
+    ]
+
+    return {
+        "pmid": pmid,
+        "title": text_of(".//Article/ArticleTitle"),
+        "abstract": "\n".join(abstract_parts) or None,
+        "journal": text_of(".//Journal/Title"),
+        "pub_year": int(year) if year and year.isdigit() else None,
+        "authors": "; ".join(authors),
+        "publication_types": "; ".join(pub_types[:4]),
+        "doi": doi or "",
+        "source_url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "",
+    }
+
+
+class PubMedProducer:
+    """Ingestion producer for the PubMed literature database (NCBI E-utilities).
+
+    The Day 5 brief calls for trial data drawn from multiple sources. Trials say
+    what a study intends to do; the literature says what studies have already
+    found. Retrieval spans both, and every answer records which kind of evidence
+    it leaned on.
+
+    Uses the same three-tier resilience ladder as the registry producer:
+    LIVE -> REPLAY from the cached raw XML -> clearly-labelled SYNTHETIC.
+    """
+
+    def __init__(self, broker: MockEventBroker) -> None:
+        self.broker = broker
+        self.raw_cache = os.path.join(settings.landing_zone, "pubmed_raw.xml")
+        self.mode = "UNKNOWN"
+
+    @property
+    def query(self) -> str:
+        return settings.pubmed_query or settings.ctgov_condition
+
+    # -- tier 1 ---------------------------------------------------------------
+    def _fetch_live(self) -> str:
+        import httpx
+
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            search = client.get(
+                f"{settings.pubmed_api}/esearch.fcgi",
+                params={
+                    "db": "pubmed",
+                    "term": f"{self.query}[Title/Abstract]",
+                    "retmax": settings.pubmed_target_records,
+                    "retmode": "json",
+                    "sort": "relevance",
+                },
+            )
+            search.raise_for_status()
+            pmids = (search.json().get("esearchresult") or {}).get("idlist") or []
+            if not pmids:
+                raise RuntimeError(f"PubMed returned no articles for '{self.query}'.")
+
+            fetch = client.get(
+                f"{settings.pubmed_api}/efetch.fcgi",
+                params={"db": "pubmed", "id": ",".join(pmids), "retmode": "xml"},
+            )
+            fetch.raise_for_status()
+
+        os.makedirs(settings.landing_zone, exist_ok=True)
+        with open(self.raw_cache, "w", encoding="utf-8") as handle:
+            handle.write(fetch.text)
+        return fetch.text
+
+    # -- tier 2 ---------------------------------------------------------------
+    def _fetch_cached(self) -> str:
+        with open(self.raw_cache, encoding="utf-8") as handle:
+            return handle.read()
+
+    # -- tier 3 ---------------------------------------------------------------
+    def _fetch_synthetic(self) -> str:
+        """Schema-faithful stand-in articles, built as real XML.
+
+        PMIDs are prefixed 999 so they can never be mistaken for real citations
+        during a review. Every value is escaped: journal titles legitimately
+        contain ampersands, and an unescaped one produces malformed XML.
+        """
+        from xml.sax.saxutils import escape
+
+        blueprint = [
+            ("9990001", "Metformin monotherapy and glycaemic durability in type 2 diabetes",
+             "Diabetes Care", 2024, "Randomized Controlled Trial", [
+                 ("BACKGROUND", "Metformin remains first-line therapy for type 2 diabetes mellitus."),
+                 ("METHODS", "We followed 1,240 adults for 36 months, measuring glycated "
+                             "haemoglobin every quarter."),
+                 ("RESULTS", "Mean HbA1c fell by 1.1 percentage points at 12 months, and "
+                             "durability declined thereafter."),
+                 ("CONCLUSIONS", "Early combination therapy warrants evaluation in patients "
+                                 "with a baseline HbA1c above 9%."),
+             ]),
+            ("9990002", "SGLT2 inhibition and renal outcomes in diabetic kidney disease",
+             "New England Journal of Medicine", 2023, "Randomized Controlled Trial", [
+                 ("BACKGROUND", "Diabetic kidney disease remains the leading cause of "
+                                "end-stage renal failure."),
+                 ("METHODS", "Participants with an estimated glomerular filtration rate of "
+                             "25 to 75 mL/min/1.73m2 were randomised."),
+                 ("RESULTS", "The intervention reduced the composite renal endpoint by 31%."),
+                 ("CONCLUSIONS", "Renal benefit was consistent across baseline albuminuria strata."),
+             ]),
+            ("9990003", "Continuous glucose monitoring and hypoglycaemia in older adults",
+             "The Lancet Diabetes & Endocrinology", 2025, "Randomized Controlled Trial", [
+                 ("BACKGROUND", "Older adults on insulin face substantial hypoglycaemia risk."),
+                 ("METHODS", "A randomised trial in adults aged 65 years and above compared "
+                             "continuous monitoring with fingerstick testing."),
+                 ("RESULTS", "Time below 70 mg/dL fell from 5.1% to 2.4%."),
+                 ("CONCLUSIONS", "Continuous monitoring reduced hypoglycaemia without "
+                                 "worsening overall glycaemic control."),
+             ]),
+            ("9990004", "Structured exercise in newly diagnosed type 2 diabetes: a meta-analysis",
+             "BMJ", 2022, "Meta-Analysis", [
+                 ("BACKGROUND", "Lifestyle intervention is recommended at diagnosis but "
+                                "adherence is poor."),
+                 ("METHODS", "Twenty-two randomised trials comprising 4,800 participants "
+                             "were pooled."),
+                 ("RESULTS", "Supervised programmes lowered HbA1c by 0.6 percentage points "
+                             "versus advice alone."),
+                 ("CONCLUSIONS", "Supervision, not exercise volume, explained most of the "
+                                 "between-trial variance."),
+             ]),
+        ]
+
+        articles = []
+        for pmid, title, journal, year, pub_type, sections in blueprint:
+            abstract = "".join(
+                f'<AbstractText Label="{escape(label)}">{escape(body)}</AbstractText>'
+                for label, body in sections
+            )
+            articles.append(
+                f"<PubmedArticle><MedlineCitation><PMID>{pmid}</PMID>"
+                f"<Article><ArticleTitle>{escape(title)}</ArticleTitle>"
+                f"<Abstract>{abstract}</Abstract>"
+                f"<Journal><Title>{escape(journal)}</Title>"
+                f"<JournalIssue><PubDate><Year>{year}</Year></PubDate></JournalIssue></Journal>"
+                f"<AuthorList><Author><LastName>Synthetic</LastName>"
+                f"<Initials>A</Initials></Author></AuthorList>"
+                f"<PublicationTypeList><PublicationType>{escape(pub_type)}</PublicationType>"
+                f"</PublicationTypeList></Article></MedlineCitation>"
+                f"<PubmedData><ArticleIdList>"
+                f'<ArticleId IdType="doi">10.0000/synth.{pmid}</ArticleId>'
+                f"</ArticleIdList></PubmedData></PubmedArticle>"
+            )
+        return "<PubmedArticleSet>" + "".join(articles) + "</PubmedArticleSet>"
+
+    async def run(self, allow_live: bool = True) -> int:
+        raw = ""
+        if allow_live:
+            try:
+                logger.info(f"Calling PubMed E-utilities for '{self.query}'...")
+                raw = self._fetch_live()
+                self.mode = "LIVE"
+            except Exception as exc:
+                logger.warning(f"Live PubMed call failed ({type(exc).__name__}: {exc}). Falling back.")
+
+        if not raw and os.path.exists(self.raw_cache):
+            raw = self._fetch_cached()
+            self.mode = "REPLAY"
+            logger.info("Replaying cached raw PubMed XML from the landing zone.")
+
+        if not raw:
+            raw = self._fetch_synthetic()
+            self.mode = "SYNTHETIC"
+            logger.warning("Using SYNTHETIC PubMed records - PMIDs are prefixed '999'.")
+
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            logger.error(f"PubMed response was not parseable XML: {exc}")
+            return 0
+
+        articles = root.findall(".//PubmedArticle")
+        print(f"📥 [PRODUCER: PubMed] Ingestion mode = {self.mode} | {len(articles)} articles")
+        for article in articles:
+            record = flatten_pubmed_article(article)
+            if record.get("pmid"):
+                await self.broker.publish("raw_literature", record, source="PUBMED_EUTILS")
+
+        print(f"📡 [BROKER] Published {self.broker.published_counts['raw_literature']} events "
+              f"to topic 'raw_literature'")
+        return len(articles)
+
+
 class InternalEHRProducer:
     """Second ingestion source: the hospital's internal patient records.
 
@@ -490,6 +754,7 @@ class InternalEHRProducer:
             "patient_name": "Sarah Al-Mutairi", "medical_record_number": "MRN-4471902",
             "date_of_birth": "1958-03-14", "phone": "+966-55-114-8820",
             "email": "s.almutairi@example-hospital.sa", "address": "8123 King Fahd Road, Riyadh",
+            "gender": "female",
             "age_years": 68, "diagnosis": "Type 2 diabetes mellitus with diabetic nephropathy",
             "hba1c": 8.4, "comorbidities": "hypertension; stage 3 chronic kidney disease",
         },
@@ -497,6 +762,7 @@ class InternalEHRProducer:
             "patient_name": "Omar Haddad", "medical_record_number": "MRN-3390114",
             "date_of_birth": "1979-11-02", "phone": "+966-50-772-3391",
             "email": "o.haddad@example-hospital.sa", "address": "44 Prince Sultan Street, Jeddah",
+            "gender": "male",
             "age_years": 46, "diagnosis": "Newly diagnosed type 2 diabetes mellitus",
             "hba1c": 7.2, "comorbidities": "obesity",
         },
@@ -504,6 +770,7 @@ class InternalEHRProducer:
             "patient_name": "Layla Ibrahim", "medical_record_number": "MRN-9920township",
             "date_of_birth": "2009-06-21", "phone": "+966-53-441-0092",
             "email": "not-an-email", "address": "17 Olaya District, Riyadh",
+            "gender": "F",
             "age_years": 16, "diagnosis": "Type 1 diabetes mellitus",
             "hba1c": 9.1, "comorbidities": "",
         },
@@ -521,17 +788,273 @@ class InternalEHRProducer:
 
 
 # =====================================================================
-# 2. ARCHITECTURAL COMPONENT: AUTOMATED DATA QUALITY GATE
+# 2. ARCHITECTURAL COMPONENT: FHIR CONFORMANCE VALIDATION
 # =====================================================================
 
-class DataQualityEngine:
-    """Executes automated quality assertions across the six quality dimensions.
+class FHIRValidator:
+    """Validates records against minimal FHIR R4 resource profiles.
+
+    FHIR is the interoperability standard healthcare systems exchange data in.
+    Validating against it is what lets this platform claim its records could
+    cross a hospital boundary rather than only working in its own schema.
+
+    Two resource types are covered:
+
+        Patient        - the internal EHR records, mapped to the R4 Patient
+                         resource before de-identification.
+        ResearchStudy  - the registry trials, mapped to the R4 ResearchStudy
+                         resource.
+
+    The profiles here are deliberately minimal - required elements, cardinality,
+    data types, and the bound value sets that actually bite in practice. A full
+    R4 StructureDefinition is thousands of lines and would need a server; the
+    checks below are the ones that catch real interoperability defects.
+    """
+
+    # Bound value sets from the R4 specification.
+    ADMINISTRATIVE_GENDER = {"male", "female", "other", "unknown"}
+    RESEARCH_STUDY_STATUS = {
+        "active", "administratively-completed", "approved", "closed-to-accrual",
+        "closed-to-accrual-and-intervention", "completed", "disapproved",
+        "in-review", "temporarily-closed-to-accrual",
+        "temporarily-closed-to-accrual-and-intervention", "withdrawn",
+    }
+
+    # ClinicalTrials.gov overallStatus -> FHIR ResearchStudy.status
+    CTGOV_STATUS_MAP = {
+        "RECRUITING": "active",
+        "NOT_YET_RECRUITING": "approved",
+        "ENROLLING_BY_INVITATION": "active",
+        "ACTIVE_NOT_RECRUITING": "closed-to-accrual",
+        "COMPLETED": "completed",
+        "SUSPENDED": "temporarily-closed-to-accrual",
+        "TERMINATED": "administratively-completed",
+        "WITHDRAWN": "withdrawn",
+        "UNKNOWN": "in-review",
+    }
+
+    DATE_PATTERN = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+
+    # -- resource construction ------------------------------------------------
+    @classmethod
+    def to_patient_resource(cls, record: dict) -> dict[str, Any]:
+        """Maps an internal EHR record onto a FHIR R4 Patient resource."""
+        name = str(record.get("patient_name") or "").split()
+        return {
+            "resourceType": "Patient",
+            "identifier": [{
+                "system": "urn:oid:2.16.840.1.113883.4.1",
+                "value": record.get("medical_record_number"),
+            }],
+            "active": True,
+            "name": [{
+                "use": "official",
+                "family": name[-1] if name else None,
+                "given": name[:-1] or None,
+            }],
+            "telecom": [
+                {"system": "phone", "value": record.get("phone")},
+                {"system": "email", "value": record.get("email")},
+            ],
+            "gender": record.get("gender"),
+            "birthDate": record.get("date_of_birth"),
+            "address": [{"text": record.get("address")}],
+        }
+
+    @classmethod
+    def to_research_study_resource(cls, record: dict) -> dict[str, Any]:
+        """Maps a registry trial onto a FHIR R4 ResearchStudy resource."""
+        raw_status = str(record.get("overall_status") or "").upper()
+        return {
+            "resourceType": "ResearchStudy",
+            "identifier": [{
+                "system": "https://clinicaltrials.gov",
+                "value": record.get("nct_id"),
+            }],
+            "title": record.get("brief_title"),
+            "status": cls.CTGOV_STATUS_MAP.get(raw_status),
+            "_sourceStatus": raw_status,
+            "phase": {"text": record.get("phase") or "N/A"},
+            "condition": [
+                {"text": c.strip()}
+                for c in str(record.get("conditions") or "").split(";") if c.strip()
+            ],
+            "description": record.get("brief_summary"),
+            "enrollment": record.get("enrollment"),
+            "sponsor": {"display": record.get("sponsor")},
+        }
+
+    # -- validation -----------------------------------------------------------
+    @classmethod
+    def validate_patient(cls, resource: dict) -> list[str]:
+        """Returns a list of conformance issues; empty means the resource conforms."""
+        issues: list[str] = []
+
+        if resource.get("resourceType") != "Patient":
+            issues.append("resourceType must be 'Patient'")
+
+        identifiers = resource.get("identifier") or []
+        if not identifiers or not identifiers[0].get("value"):
+            issues.append("Patient.identifier is required (1..*) and must carry a value")
+
+        names = resource.get("name") or []
+        if not names or not names[0].get("family"):
+            issues.append("Patient.name.family is required for an official name")
+
+        gender = resource.get("gender")
+        if gender is not None and gender not in cls.ADMINISTRATIVE_GENDER:
+            issues.append(
+                f"Patient.gender '{gender}' is outside the bound value set "
+                f"administrative-gender ({'|'.join(sorted(cls.ADMINISTRATIVE_GENDER))})"
+            )
+
+        birth = resource.get("birthDate")
+        if birth is not None and not cls.DATE_PATTERN.match(str(birth)):
+            issues.append(f"Patient.birthDate '{birth}' is not a valid FHIR date")
+
+        for contact in resource.get("telecom") or []:
+            if contact.get("system") == "email":
+                value = contact.get("value")
+                if value and not re.match(r"^[\w.+-]+@[\w-]+\.[\w.]{2,}$", str(value)):
+                    issues.append(f"Patient.telecom(email) '{value}' is not a valid address")
+
+        return issues
+
+    @classmethod
+    def validate_research_study(cls, resource: dict) -> list[str]:
+        issues: list[str] = []
+
+        if resource.get("resourceType") != "ResearchStudy":
+            issues.append("resourceType must be 'ResearchStudy'")
+
+        identifiers = resource.get("identifier") or []
+        if not identifiers or not identifiers[0].get("value"):
+            issues.append("ResearchStudy.identifier is required and must carry a value")
+
+        if not resource.get("title"):
+            issues.append("ResearchStudy.title is required for a citable study")
+
+        status = resource.get("status")
+        if status is None:
+            issues.append(
+                f"ResearchStudy.status could not be derived from registry status "
+                f"'{resource.get('_sourceStatus')}' - no mapping into the FHIR value set"
+            )
+        elif status not in cls.RESEARCH_STUDY_STATUS:
+            issues.append(f"ResearchStudy.status '{status}' is outside the R4 value set")
+
+        enrollment = resource.get("enrollment")
+        if enrollment is not None and not isinstance(enrollment, bool):
+            try:
+                if float(enrollment) < 0:
+                    issues.append("ResearchStudy.enrollment must not be negative")
+            except (TypeError, ValueError):
+                issues.append(f"ResearchStudy.enrollment '{enrollment}' is not a number")
+
+        return issues
+
+    @classmethod
+    def validate_batch(cls, records: list[dict], kind: str) -> tuple[dict[str, list[str]], dict]:
+        """Validates every record and returns (issues_by_key, summary report)."""
+        build = cls.to_patient_resource if kind == "Patient" else cls.to_research_study_resource
+        check = cls.validate_patient if kind == "Patient" else cls.validate_research_study
+        key_field = "medical_record_number" if kind == "Patient" else "nct_id"
+
+        issues: dict[str, list[str]] = {}
+        for record in records:
+            found = check(build(record))
+            if found:
+                issues[str(record.get(key_field) or "<unknown>")] = found
+
+        return issues, {
+            "resource_type": kind,
+            "resources_validated": len(records),
+            "conformant": len(records) - len(issues),
+            "non_conformant": len(issues),
+            "issue_count": sum(len(v) for v in issues.values()),
+        }
+
+
+# =====================================================================
+# 3. ARCHITECTURAL COMPONENT: AUTOMATED DATA QUALITY GATE
+# =====================================================================
+
+class QualityEngineBase:
+    """Shared machinery for the severity-graded quality gates.
 
     The engine grades every record individually AND produces a batch verdict.
-    Individual failures are quarantined; a batch whose failure ratio exceeds the
-    configured threshold halts the pipeline entirely, exactly as a production
+    Individual fatal failures are quarantined; a batch whose fatal ratio exceeds
+    the configured threshold halts the pipeline entirely, exactly as a production
     gatekeeper would when it suspects an upstream system is broken.
+
+    Violations carry a severity. FATAL means the record cannot be trusted or
+    cited at all, so it is quarantined. ADVISORY means the record is usable but
+    imperfect - a completed trial from 2017 is still valid evidence, it is simply
+    old. Advisory findings are counted, attached to the record as a flag, and
+    surfaced to the researcher in the evidence trail rather than silently
+    discarded. Only fatal violations count towards the halt ratio.
+
+    Subclasses implement `_checks` for their own source's dimensions.
     """
+
+    SOURCE_LABEL = "records"
+
+    def __init__(self, dataframe: pd.DataFrame) -> None:
+        self.df = dataframe.copy()
+        self.results: dict[str, Any] = {
+            "timestamp": utcnow(),
+            "source": self.SOURCE_LABEL,
+            "records_evaluated": int(len(dataframe)),
+            "metrics": {},
+            "passed_all_gates": True,
+        }
+
+    def _checks(self, df: pd.DataFrame, record_metric) -> None:
+        raise NotImplementedError
+
+    def run_all_checks(self) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+        """Returns (clean_frame, rejected_frame, quality_report)."""
+        logger.info(f"Initiating automated data quality scan over {self.SOURCE_LABEL}...")
+        df = self.df
+        fatal = pd.Series([""] * len(df), index=df.index)
+        advisory = pd.Series([""] * len(df), index=df.index)
+
+        def record_metric(name: str, mask: pd.Series, reason: str, severity: str) -> None:
+            """Registers one dimension and tags every offending row with a reason."""
+            mask = mask.fillna(False).astype(bool)
+            count = int(mask.sum())
+            self.results["metrics"][name] = {
+                "violations": count,
+                "severity": severity,
+                "status": "PASSED" if count == 0 else "FAILED",
+            }
+            target = fatal if severity == "FATAL" else advisory
+            target.loc[mask] = target.loc[mask].str.cat([reason] * count, sep="|").str.strip("|")
+
+        self._checks(df, record_metric)
+
+        for check in self.results["metrics"].values():
+            if check["status"] == "FAILED":
+                self.results["passed_all_gates"] = False
+
+        df = df.assign(quality_failures=fatal, data_quality_flags=advisory)
+        clean = df[df["quality_failures"] == ""].drop(columns=["quality_failures"])
+        rejected = df[df["quality_failures"] != ""].drop(columns=["data_quality_flags"])
+
+        ratio = len(rejected) / len(df) if len(df) else 0.0
+        self.results["rejected_records"] = int(len(rejected))
+        self.results["clean_records"] = int(len(clean))
+        self.results["records_flagged_advisory"] = int((clean["data_quality_flags"] != "").sum())
+        self.results["fatal_failure_ratio"] = round(ratio, 4)
+        self.results["halt_pipeline"] = ratio > settings.quality_halt_threshold
+
+        return clean, rejected, self.results
+
+
+class DataQualityEngine(QualityEngineBase):
+    """The six quality dimensions applied to ClinicalTrials.gov registry records."""
+
+    SOURCE_LABEL = "clinical trials (6 dimensions)"
 
     REQUIRED_FIELDS = ["nct_id", "brief_title", "brief_summary", "overall_status"]
     VALID_STATUSES = {
@@ -542,41 +1065,7 @@ class DataQualityEngine:
     }
     NCT_PATTERN = re.compile(r"^(NCT\d{8}|SYNTH\d{8})$")
 
-    def __init__(self, dataframe: pd.DataFrame) -> None:
-        self.df = dataframe.copy()
-        self.results: dict[str, Any] = {
-            "timestamp": utcnow(),
-            "records_evaluated": int(len(dataframe)),
-            "metrics": {},
-            "passed_all_gates": True,
-        }
-
-    def run_all_checks(self) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-        """Returns (clean_frame, rejected_frame, quality_report).
-
-        Violations carry a severity. FATAL means the record cannot be trusted or
-        cited at all, so it is quarantined. ADVISORY means the record is usable
-        but imperfect - a completed trial from 2017 is still valid evidence, it
-        is simply old. Advisory findings are counted, attached to the record as
-        a flag, and surfaced to the researcher in the evidence trail rather than
-        silently discarded. Only fatal violations count towards the halt ratio.
-        """
-        logger.info("Initiating automated data quality scan across 6 dimensions...")
-        df = self.df
-        fatal = pd.Series([""] * len(df), index=df.index)
-        advisory = pd.Series([""] * len(df), index=df.index)
-
-        def record_metric(name: str, mask: pd.Series, reason: str, severity: str) -> None:
-            """Registers one dimension and tags every offending row with a reason."""
-            count = int(mask.sum())
-            self.results["metrics"][name] = {
-                "violations": count,
-                "severity": severity,
-                "status": "PASSED" if count == 0 else "FAILED",
-            }
-            target = fatal if severity == "FATAL" else advisory
-            target.loc[mask] = target.loc[mask].str.cat([reason] * count, sep="|").str.strip("|")
-
+    def _checks(self, df: pd.DataFrame, record_metric) -> None:
         # 1. COMPLETENESS - a record with no identifier or title cannot be cited.
         unciteable = df["nct_id"].isnull() | (df["brief_title"].fillna("").str.strip() == "")
         record_metric("completeness_identity", unciteable, "MISSING_IDENTITY", "FATAL")
@@ -618,22 +1107,66 @@ class DataQualityEngine:
         stale = (updated.notna() & (updated < cutoff))
         record_metric("timeliness_last_update", stale, "STALE_RECORD", "ADVISORY")
 
-        for check in self.results["metrics"].values():
-            if check["status"] == "FAILED":
-                self.results["passed_all_gates"] = False
 
-        df = df.assign(quality_failures=fatal, data_quality_flags=advisory)
-        clean = df[df["quality_failures"] == ""].drop(columns=["quality_failures"])
-        rejected = df[df["quality_failures"] != ""].drop(columns=["data_quality_flags"])
+class LiteratureQualityEngine(QualityEngineBase):
+    """The same six dimensions, applied to PubMed literature records.
 
-        ratio = len(rejected) / len(df) if len(df) else 0.0
-        self.results["rejected_records"] = int(len(rejected))
-        self.results["clean_records"] = int(len(clean))
-        self.results["records_flagged_advisory"] = int((clean["data_quality_flags"] != "").sum())
-        self.results["fatal_failure_ratio"] = round(ratio, 4)
-        self.results["halt_pipeline"] = ratio > settings.quality_halt_threshold
+    The dimensions are identical in spirit but land on different fields: an
+    article is uncitable without a PMID and title, its identifier has its own
+    format, and "stale" means a publication year rather than a last-updated
+    timestamp. Reusing the trial checks verbatim would have quietly passed
+    everything, which is worse than not checking at all.
+    """
 
-        return clean, rejected, self.results
+    SOURCE_LABEL = "literature (6 dimensions)"
+
+    PMID_PATTERN = re.compile(r"^\d{1,8}$")
+    EVIDENCE_TYPES = {
+        "journal article", "randomized controlled trial", "meta-analysis",
+        "systematic review", "review", "clinical trial", "comparative study",
+        "multicenter study", "observational study",
+    }
+
+    def _checks(self, df: pd.DataFrame, record_metric) -> None:
+        # 1. COMPLETENESS - an article with no identifier or title cannot be cited.
+        record_metric(
+            "completeness_identity",
+            df["pmid"].isnull() | (df["title"].fillna("").str.strip() == ""),
+            "MISSING_IDENTITY", "FATAL",
+        )
+        # An abstract-less record is a citation with no retrievable content. It
+        # is kept - the title still carries signal - but flagged.
+        record_metric(
+            "completeness_abstract",
+            df["abstract"].isnull() | (df["abstract"].fillna("").str.strip() == ""),
+            "MISSING_ABSTRACT", "ADVISORY",
+        )
+        # 2. VALIDITY - PMIDs are bare integers.
+        record_metric(
+            "validity_pmid_format",
+            ~df["pmid"].fillna("").astype(str).str.match(self.PMID_PATTERN),
+            "INVALID_PMID", "FATAL",
+        )
+        # 3. UNIQUENESS - the same article must not be indexed twice.
+        record_metric("uniqueness_pmid", df.duplicated(subset=["pmid"], keep="first"),
+                      "DUPLICATE_PMID", "FATAL")
+        # 4. ACCURACY - publication years must be physically possible.
+        years = pd.to_numeric(df["pub_year"], errors="coerce")
+        current = dt.datetime.now(dt.UTC).year
+        record_metric("accuracy_publication_year",
+                      (years < 1800) | (years > current + 1),
+                      "IMPOSSIBLE_PUBLICATION_YEAR", "FATAL")
+        # 5. CONSISTENCY - publication type should be a recognised evidence type.
+        types_lower = df["publication_types"].fillna("").str.lower()
+        record_metric(
+            "consistency_publication_type",
+            ~types_lower.apply(lambda v: any(t in v for t in self.EVIDENCE_TYPES)),
+            "UNRECOGNISED_PUBLICATION_TYPE", "ADVISORY",
+        )
+        # 6. TIMELINESS - clinical evidence older than ten years is still valid
+        # but should be read with its age in view.
+        record_metric("timeliness_publication_year", years < (current - 10),
+                      "DATED_EVIDENCE", "ADVISORY")
 
 
 def quarantine_batch(rejected: pd.DataFrame, label: str) -> str | None:
@@ -651,7 +1184,7 @@ def quarantine_batch(rejected: pd.DataFrame, label: str) -> str | None:
 
 
 # =====================================================================
-# 3. ARCHITECTURAL COMPONENT: GOVERNANCE, PHI PROTECTION, LINEAGE & AUDIT
+# 4. ARCHITECTURAL COMPONENT: GOVERNANCE, PHI PROTECTION, LINEAGE & AUDIT
 # =====================================================================
 
 class PHIGuard:
@@ -866,7 +1399,7 @@ class GovernanceEngine:
 
 
 # =====================================================================
-# 4. ARCHITECTURAL COMPONENT: DELTA-STYLE LAKEHOUSE STORAGE LAYER
+# 5. ARCHITECTURAL COMPONENT: DELTA-STYLE LAKEHOUSE STORAGE LAYER
 # =====================================================================
 
 class SchemaEnforcementError(Exception):
@@ -991,7 +1524,7 @@ class DeltaStyleLakehouse:
 
 
 # =====================================================================
-# 5. ARCHITECTURAL COMPONENT: CHUNKING & EMBEDDING LAYER
+# 6. ARCHITECTURAL COMPONENT: CHUNKING & EMBEDDING LAYER
 # =====================================================================
 
 class RecursiveChunker:
@@ -1079,7 +1612,49 @@ class RecursiveChunker:
             for index, piece in enumerate(pieces):
                 chunks.append({
                     "chunk_id": f"{nct_id}::{section_name}::{index}",
+                    "source_type": "trial",
+                    "record_id": nct_id,
                     "nct_id": nct_id,
+                    "section": section_name,
+                    "chunk_index": index,
+                    "text": f"{header}[{section_name.upper()}] {piece}".strip(),
+                })
+        return chunks
+
+    def chunk_article(self, record: dict) -> list[dict]:
+        """Turns one PubMed article into retrievable, self-contained chunks.
+
+        Structured abstracts already carry their own section labels, so the
+        recursive splitter is given the labelled text and each chunk keeps the
+        citation header - a retrieved passage must be attributable on sight.
+        """
+        pmid = record["pmid"]
+        header = (
+            f"Article PMID {pmid} - {record.get('title', '')}\n"
+            f"{record.get('journal') or 'Unknown journal'} ({record.get('pub_year') or 'n.d.'})"
+            f" | {record.get('publication_types') or 'Journal Article'}\n"
+        )
+
+        sections = {
+            "abstract": record.get("abstract") or "",
+            "citation": (
+                f"{record.get('authors') or 'Unknown authors'}. {record.get('title', '')}. "
+                f"{record.get('journal') or ''} {record.get('pub_year') or ''}. "
+                f"doi:{record.get('doi') or 'n/a'}"
+            ),
+        }
+
+        chunks: list[dict] = []
+        for section_name, body in sections.items():
+            if not str(body).strip():
+                continue
+            pieces = self._apply_overlap(self._split(str(body)))
+            for index, piece in enumerate(pieces):
+                chunks.append({
+                    "chunk_id": f"PMID{pmid}::{section_name}::{index}",
+                    "source_type": "literature",
+                    "record_id": f"PMID{pmid}",
+                    "pmid": pmid,
                     "section": section_name,
                     "chunk_index": index,
                     "text": f"{header}[{section_name.upper()}] {piece}".strip(),
@@ -1148,7 +1723,7 @@ class EmbeddingModel:
 
 
 # =====================================================================
-# 6. ARCHITECTURAL COMPONENT: VECTOR DATABASE LAYER
+# 7. ARCHITECTURAL COMPONENT: VECTOR DATABASE LAYER
 # =====================================================================
 
 class VectorStore:
@@ -1206,6 +1781,14 @@ class VectorStore:
     def count(self) -> int:
         return self.collection.count()
 
+    def indexed_dimensions(self) -> int | None:
+        """Width of the vectors already stored, or None on an empty collection."""
+        if self.collection.count() == 0:
+            return None
+        payload = self.collection.get(limit=1, include=["embeddings"])
+        vectors = payload.get("embeddings")
+        return len(vectors[0]) if vectors is not None and len(vectors) else None
+
     def query(self, embedding: list[float], top_k: int) -> list[dict]:
         results = self.collection.query(
             query_embeddings=[embedding],
@@ -1234,7 +1817,7 @@ class VectorStore:
 
 
 # =====================================================================
-# 7. ARCHITECTURAL COMPONENT: ADVANCED RAG RETRIEVAL
+# 8. ARCHITECTURAL COMPONENT: ADVANCED RAG RETRIEVAL
 # =====================================================================
 
 class LexicalReranker:
@@ -1396,7 +1979,7 @@ class ContradictionDetector:
 
 
 # =====================================================================
-# 8. ARCHITECTURAL COMPONENT: GENERATION, EVIDENCE TRAIL & RAG TRIAD
+# 9. ARCHITECTURAL COMPONENT: GENERATION, EVIDENCE TRAIL & RAG TRIAD
 # =====================================================================
 
 SYSTEM_PROMPT = """You are a clinical research assistant supporting trial matching.
@@ -1569,6 +2152,9 @@ class ClinicalTrialRAG:
         evidence = [
             {
                 "citation": index,
+                "source_type": candidate["metadata"].get("source_type") or "trial",
+                "record_id": (candidate["metadata"].get("record_id")
+                              or candidate["metadata"].get("nct_id")),
                 "nct_id": candidate["metadata"].get("nct_id"),
                 "chunk_id": candidate["chunk_id"],
                 "section": candidate["metadata"].get("section"),
@@ -1592,7 +2178,7 @@ class ClinicalTrialRAG:
                 "query_redacted": safe_question,
                 "query_hash": hashlib.sha256(question.encode()).hexdigest()[:16],
                 "phi_stripped_from_query": sorted({f["type"] for f in phi_findings}),
-                "nct_ids_returned": [e["nct_id"] for e in evidence],
+                "sources_returned": [f"{e['source_type']}:{e['record_id']}" for e in evidence],
                 "chunks_returned": [e["chunk_id"] for e in evidence],
                 "rag_triad": triad,
                 "contradiction_alerts": len(alerts),
@@ -1620,7 +2206,7 @@ class ClinicalTrialRAG:
 
 
 # =====================================================================
-# 9. ARCHITECTURAL COMPONENT: AI INFRASTRUCTURE ORCHESTRATION (THE DAG)
+# 10. ARCHITECTURAL COMPONENT: AI INFRASTRUCTURE ORCHESTRATION (THE DAG)
 # =====================================================================
 
 class PipelineOrchestrator:
@@ -1706,7 +2292,7 @@ class PipelineOrchestrator:
 
 
 def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> PipelineOrchestrator:
-    """Wires the six pipeline stages into a dependency-ordered DAG."""
+    """Wires the seven pipeline stages into a dependency-ordered DAG."""
     orchestrator = PipelineOrchestrator()
     lineage = LineageTracker()
     audit = AuditTrail()
@@ -1717,29 +2303,41 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
     def _ingest(state: dict) -> None:
         ensure_dirs()
 
-        async def stream() -> tuple[list[dict], list[dict], str]:
+        async def stream() -> tuple[list[dict], list[dict], list[dict], str, str]:
             broker = MockEventBroker()
             trials_producer = ClinicalTrialsProducer(broker)
+            pubmed_producer = PubMedProducer(broker)
             ehr_producer = InternalEHRProducer(broker)
+            # The three producers publish independently; nothing downstream is
+            # waiting on them, which is the decoupling the course calls loose.
             await trials_producer.run(allow_live=allow_live)
+            await pubmed_producer.run(allow_live=allow_live)
             await ehr_producer.run()
-            trial_events = broker.drain("raw_clinical_trials")
-            patient_events = broker.drain("raw_patient_records")
-            return trial_events, patient_events, trials_producer.mode
+            return (
+                broker.drain("raw_clinical_trials"),
+                broker.drain("raw_literature"),
+                broker.drain("raw_patient_records"),
+                trials_producer.mode,
+                pubmed_producer.mode,
+            )
 
-        trial_events, patient_events, mode = asyncio.run(stream())
+        trial_events, lit_events, patient_events, mode, pubmed_mode = asyncio.run(stream())
 
         state["ingestion_mode"] = mode
+        state["pubmed_mode"] = pubmed_mode
         state["trials_raw"] = pd.DataFrame([e["payload"] for e in trial_events])
+        state["literature_raw"] = pd.DataFrame([e["payload"] for e in lit_events])
         state["patients_raw"] = [e["payload"] for e in patient_events]
         state["lineage_ingest"] = lineage.record(
             operation="ingest",
-            inputs=["clinicaltrials.gov/api/v2/studies", "internal_ehr"],
-            outputs=["topic:raw_clinical_trials", "topic:raw_patient_records"],
-            record_count=len(trial_events) + len(patient_events),
-            details={"mode": mode, "condition": settings.ctgov_condition},
+            inputs=["clinicaltrials.gov/api/v2/studies", "pubmed/eutils", "internal_ehr"],
+            outputs=["topic:raw_clinical_trials", "topic:raw_literature", "topic:raw_patient_records"],
+            record_count=len(trial_events) + len(lit_events) + len(patient_events),
+            details={"trials_mode": mode, "pubmed_mode": pubmed_mode,
+                     "condition": settings.ctgov_condition},
         )
-        print(f"✅ [INGEST] {len(trial_events)} trials + {len(patient_events)} patient records on the bus")
+        print(f"✅ [INGEST] {len(trial_events)} trials + {len(lit_events)} articles + "
+              f"{len(patient_events)} patient records on the bus")
 
     # ---- Task 2: QUALITY -----------------------------------------------------
     @orchestrator.task("quality", depends_on=["ingest"])
@@ -1754,23 +2352,79 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
 
         if report["halt_pipeline"]:
             raise RuntimeError(
-                f"CRITICAL: {report['failure_ratio']:.0%} of the batch failed quality gates "
+                f"CRITICAL: {report['fatal_failure_ratio']:.0%} of the batch failed quality gates "
                 f"(threshold {settings.quality_halt_threshold:.0%}). Pipeline halted; batch quarantined."
             )
 
+        # The literature stream gets its own gate: the dimensions are the same
+        # six, but they land on different fields, and reusing the trial checks
+        # verbatim would have quietly passed everything.
+        lit_engine = LiteratureQualityEngine(state["literature_raw"])
+        lit_clean, lit_rejected, lit_report = lit_engine.run_all_checks()
+
+        banner("DATA QUALITY VALIDATION REPORT - LITERATURE")
+        print(json.dumps(lit_report, indent=4))
+        lit_quarantine = quarantine_batch(lit_rejected, "literature")
+
         state["trials_clean"] = clean
+        state["literature_clean"] = lit_clean
         state["quality_report"] = report
+        state["literature_quality_report"] = lit_report
         state["lineage_quality"] = lineage.record(
             operation="quality_gate",
             inputs=[state["lineage_ingest"]],
-            outputs=["clean_batch", "quarantine_zone"],
-            record_count=len(clean),
-            details={"rejected": len(rejected), "quarantine_path": quarantine_path},
+            outputs=["clean_trials", "clean_literature", "quarantine_zone"],
+            record_count=len(clean) + len(lit_clean),
+            details={
+                "trials_rejected": len(rejected), "trials_quarantine": quarantine_path,
+                "literature_rejected": len(lit_rejected), "literature_quarantine": lit_quarantine,
+            },
         )
-        print(f"✅ [QUALITY] {len(clean)} records passed | {len(rejected)} quarantined")
+        print(f"✅ [QUALITY] trials: {len(clean)} passed / {len(rejected)} quarantined | "
+              f"literature: {len(lit_clean)} passed / {len(lit_rejected)} quarantined")
 
-    # ---- Task 3: GOVERNANCE --------------------------------------------------
-    @orchestrator.task("governance", depends_on=["quality"])
+    # ---- Task 3: FHIR CONFORMANCE -------------------------------------------
+    @orchestrator.task("fhir_validation", depends_on=["quality"])
+    def _fhir(state: dict) -> None:
+        banner("FHIR R4 CONFORMANCE VALIDATION")
+
+        patient_issues, patient_report = FHIRValidator.validate_batch(
+            state["patients_raw"], "Patient")
+        study_issues, study_report = FHIRValidator.validate_batch(
+            state["trials_clean"].to_dict(orient="records"), "ResearchStudy")
+
+        for report, issues in ((patient_report, patient_issues), (study_report, study_issues)):
+            print(f"\n  {report['resource_type']}")
+            print(f"    validated ....... {report['resources_validated']}")
+            print(f"    conformant ...... {report['conformant']}")
+            print(f"    non-conformant .. {report['non_conformant']} "
+                  f"({report['issue_count']} issues)")
+            for key, found in list(issues.items())[:4]:
+                print(f"    ⚠ {key}")
+                for issue in found:
+                    print(f"        - {issue}")
+
+        audit.log(
+            actor="pipeline", role="data_engineer", action="FHIR_VALIDATION",
+            payload={"patient": patient_report, "research_study": study_report},
+        )
+
+        state["fhir_patient_report"] = patient_report
+        state["fhir_study_report"] = study_report
+        state["fhir_patient_issues"] = patient_issues
+        state["lineage_fhir"] = lineage.record(
+            operation="fhir_conformance_validation",
+            inputs=[state["lineage_quality"]],
+            outputs=["fhir_conformance_report"],
+            record_count=patient_report["resources_validated"] + study_report["resources_validated"],
+            details={"patient": patient_report, "research_study": study_report},
+        )
+
+        total_issues = patient_report["issue_count"] + study_report["issue_count"]
+        print(f"\n✅ [FHIR] {total_issues} conformance issues reported across both resource types")
+
+    # ---- Task 4: GOVERNANCE --------------------------------------------------
+    @orchestrator.task("governance", depends_on=["fhir_validation"])
     def _governance(state: dict) -> None:
         safe_patients, all_findings = [], []
         for patient in state["patients_raw"]:
@@ -1799,14 +2453,14 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
         state["patients_safe"] = safe_patients
         state["lineage_governance"] = lineage.record(
             operation="governance_deidentification",
-            inputs=[state["lineage_quality"]],
+            inputs=[state["lineage_fhir"]],
             outputs=["deidentified_patient_profiles"],
             record_count=len(safe_patients),
             details={"phi_removed": len(all_findings)},
         )
         print(f"\n✅ [GOVERNANCE] {len(all_findings)} PHI identifiers stripped before any downstream use")
 
-    # ---- Task 4: LAKEHOUSE ---------------------------------------------------
+    # ---- Task 5: LAKEHOUSE ---------------------------------------------------
     @orchestrator.task("lakehouse", depends_on=["governance"])
     def _lakehouse(state: dict) -> None:
         lake = DeltaStyleLakehouse(settings.lakehouse_path)
@@ -1840,21 +2494,38 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
             print(f"  ❌ Transaction blocked by the Lakehouse! {exc}")
             print("  💡 This is what stops a data lake from degrading into a data swamp.")
 
+        # Literature lands in its own table. Forcing two different schemas into
+        # one table would mean disabling schema enforcement - the guardrail this
+        # layer exists to provide.
+        lit_lake = DeltaStyleLakehouse(settings.literature_lakehouse_path)
+        lit_frame = state["literature_clean"].copy()
+        lit_frame["pub_year"] = pd.to_numeric(lit_frame["pub_year"], errors="coerce")
+        for column in lit_frame.columns:
+            if lit_frame[column].dtype == object:
+                lit_frame[column] = lit_frame[column].astype("string")
+        lit_version = lit_lake.write(lit_frame, mode="overwrite", operation="WRITE")
+
         state["lakehouse"] = lake
+        state["literature_lakehouse"] = lit_lake
         state["lakehouse_version"] = version
         state["lineage_lakehouse"] = lineage.record(
             operation="lakehouse_write",
             inputs=[state["lineage_governance"]],
-            outputs=[f"{settings.lakehouse_path}@v{version}"],
-            record_count=len(frame),
-            details={"mode": "overwrite", "columns": len(frame.columns)},
+            outputs=[f"{settings.lakehouse_path}@v{version}",
+                     f"{settings.literature_lakehouse_path}@v{lit_version}"],
+            record_count=len(frame) + len(lit_frame),
+            details={"trials_columns": len(frame.columns),
+                     "literature_columns": len(lit_frame.columns),
+                     "literature_records": int(len(lit_frame))},
         )
-        print(f"\n✅ [LAKEHOUSE] Committed version {version} with {len(frame)} governed records")
+        print(f"\n✅ [LAKEHOUSE] trials v{version} ({len(frame)} records) | "
+              f"literature v{lit_version} ({len(lit_frame)} records)")
 
-    # ---- Task 5: CHUNK + EMBED ----------------------------------------------
+    # ---- Task 6: CHUNK + EMBED ----------------------------------------------
     @orchestrator.task("chunk_embed", depends_on=["lakehouse"])
     def _chunk_embed(state: dict) -> None:
         records = state["lakehouse"].read().to_dict(orient="records")
+        articles = state["literature_lakehouse"].read().to_dict(orient="records")
         chunker = RecursiveChunker(settings.chunk_size, settings.chunk_overlap)
 
         chunks: list[dict] = []
@@ -1873,6 +2544,16 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
                 chunk["classification"] = "PUBLIC"
                 chunks.append(chunk)
 
+        for article in articles:
+            for chunk in chunker.chunk_article(article):
+                chunk["lineage_id"] = state["lineage_lakehouse"]
+                chunk["source_url"] = article.get("source_url")
+                chunk["journal"] = article.get("journal")
+                chunk["pub_year"] = article.get("pub_year")
+                chunk["data_quality_flags"] = article.get("data_quality_flags") or ""
+                chunk["classification"] = "PUBLIC"
+                chunks.append(chunk)
+
         embedder = EmbeddingModel(settings.embed_model_name)
         vectors = embedder.encode([c["text"] for c in chunks])
 
@@ -1888,13 +2569,16 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
                 "chunk_size": settings.chunk_size,
                 "overlap": settings.chunk_overlap,
                 "backend": embedder.backend,
+                "model": embedder.model_name,
                 "dimensions": embedder.dimensions,
             },
         )
-        print(f"✅ [CHUNK+EMBED] {len(records)} trials -> {len(chunks)} chunks -> "
+        trial_chunks = sum(1 for c in chunks if c["source_type"] == "trial")
+        print(f"✅ [CHUNK+EMBED] {len(records)} trials + {len(articles)} articles -> "
+              f"{trial_chunks} trial chunks + {len(chunks) - trial_chunks} literature chunks -> "
               f"{vectors.shape[1]}-dim vectors via {embedder.backend}")
 
-    # ---- Task 6: VECTOR INDEX -----------------------------------------------
+    # ---- Task 7: VECTOR INDEX -----------------------------------------------
     @orchestrator.task("vector_index", depends_on=["chunk_embed"])
     def _vector_index(state: dict) -> None:
         store = VectorStore(settings.chroma_db_dir)
@@ -1931,7 +2615,7 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
 
 
 # =====================================================================
-# 10. COMMAND-LINE ENTRYPOINT
+# 11. COMMAND-LINE ENTRYPOINT
 # =====================================================================
 
 def print_query_result(result: dict) -> None:
@@ -1942,7 +2626,8 @@ def print_query_result(result: dict) -> None:
     print("  EVIDENCE TRAIL  (every claim traceable to a governed source)")
     print("-" * 70)
     for item in result["evidence"]:
-        print(f"  [{item['citation']}] {item['nct_id']} | section={item['section']} | "
+        kind = "TRIAL" if item["source_type"] == "trial" else "PAPER"
+        print(f"  [{item['citation']}] {kind} {item['record_id']} | section={item['section']} | "
               f"via={item['retrieved_by']} | rerank={item['rerank_score']}")
         print(f"       chunk   : {item['chunk_id']}")
         print(f"       lineage : {item['lineage_id']}")
@@ -1982,6 +2667,18 @@ def open_query_service() -> ClinicalTrialRAG:
             "    python clinical_trial_rag.py --stage pipeline"
         )
     embedder = EmbeddingModel(settings.embed_model_name)
+
+    # A query embedded by a different model than the index was built with is
+    # meaningless even when the dimensions happen to match, and raises an opaque
+    # error when they do not. Fail with an instruction instead.
+    indexed_dims = store.indexed_dimensions()
+    if indexed_dims is not None and indexed_dims != embedder.dimensions:
+        raise RuntimeError(
+            f"The vector index holds {indexed_dims}-dimensional vectors but the active "
+            f"embedder ('{embedder.model_name}', backend {embedder.backend}) produces "
+            f"{embedder.dimensions}. Rebuild the index with the current model:\n"
+            "    python clinical_trial_rag.py --stage pipeline"
+        )
     lineage = LineageTracker()
     audit = AuditTrail()
     governance = GovernanceEngine(lineage, audit)
