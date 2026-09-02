@@ -1,0 +1,26 @@
+# Healthcare Clinical Trial Matcher - SDAIA Day 5 Capstone
+# Python 3.11+
+
+# --- Ingestion & tabular processing (Day 1, Day 2) ---
+httpx>=0.27
+pandas>=2.2
+pyarrow>=16.0
+
+# --- Observability & configuration (Day 4) ---
+loguru>=0.7
+python-dotenv>=1.0
+
+# --- Embeddings & reranking (Day 3) ---
+# Pulls torch. On first run the models are downloaded from Hugging Face; if that
+# is unavailable the platform degrades to its deterministic offline backends.
+sentence-transformers>=3.0
+numpy>=1.26
+
+# --- Vector database (Day 3) ---
+chromadb>=0.5
+
+# --- Sparse retrieval for hybrid search (Day 3) ---
+rank-bm25>=0.2.2
+
+# --- LLM generation via OpenRouter (Day 3) ---
+openai>=1.40
