@@ -97,11 +97,14 @@ class Settings:
         # --- LLM / model layer -------------------------------------------------
         self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
         self.openrouter_model = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-coder:free")
+        self.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         self.embed_model_name = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
         self.rerank_model_name = os.getenv("RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
         # --- Source system -----------------------------------------------------
-        self.ctgov_api = "https://clinicaltrials.gov/api/v2/studies"
+        # Overridable so the ingestion path can be pointed at a registry mirror
+        # or at a local fixture server during testing.
+        self.ctgov_api = os.getenv("CTGOV_API_URL", "https://clinicaltrials.gov/api/v2/studies")
         self.ctgov_condition = os.getenv("CTGOV_CONDITION", "type 2 diabetes")
         self.ctgov_target_records = int(os.getenv("CTGOV_TARGET_RECORDS", "60"))
         self.ctgov_page_size = 50
@@ -549,33 +552,47 @@ class DataQualityEngine:
         }
 
     def run_all_checks(self) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-        """Returns (clean_frame, rejected_frame, quality_report)."""
+        """Returns (clean_frame, rejected_frame, quality_report).
+
+        Violations carry a severity. FATAL means the record cannot be trusted or
+        cited at all, so it is quarantined. ADVISORY means the record is usable
+        but imperfect - a completed trial from 2017 is still valid evidence, it
+        is simply old. Advisory findings are counted, attached to the record as
+        a flag, and surfaced to the researcher in the evidence trail rather than
+        silently discarded. Only fatal violations count towards the halt ratio.
+        """
         logger.info("Initiating automated data quality scan across 6 dimensions...")
         df = self.df
-        failures = pd.Series([""] * len(df), index=df.index)
+        fatal = pd.Series([""] * len(df), index=df.index)
+        advisory = pd.Series([""] * len(df), index=df.index)
 
-        def record_metric(name: str, mask: pd.Series, reason: str) -> None:
+        def record_metric(name: str, mask: pd.Series, reason: str, severity: str) -> None:
             """Registers one dimension and tags every offending row with a reason."""
             count = int(mask.sum())
             self.results["metrics"][name] = {
                 "violations": count,
+                "severity": severity,
                 "status": "PASSED" if count == 0 else "FAILED",
             }
-            failures.loc[mask] = failures.loc[mask].str.cat([reason] * count, sep="|").str.strip("|")
+            target = fatal if severity == "FATAL" else advisory
+            target.loc[mask] = target.loc[mask].str.cat([reason] * count, sep="|").str.strip("|")
 
-        # 1. COMPLETENESS - no critical identifier may be missing.
-        missing = df[self.REQUIRED_FIELDS].isnull().any(axis=1) | (
-            df["brief_title"].fillna("").str.strip() == ""
-        )
-        record_metric("completeness_required_fields", missing, "MISSING_REQUIRED_FIELD")
+        # 1. COMPLETENESS - a record with no identifier or title cannot be cited.
+        unciteable = df["nct_id"].isnull() | (df["brief_title"].fillna("").str.strip() == "")
+        record_metric("completeness_identity", unciteable, "MISSING_IDENTITY", "FATAL")
+
+        # A trial may legitimately publish no brief summary; its eligibility
+        # criteria still carry retrievable evidence, so this is advisory.
+        no_summary = df["brief_summary"].isnull() | (df["brief_summary"].fillna("").str.strip() == "")
+        record_metric("completeness_summary", no_summary, "MISSING_SUMMARY", "ADVISORY")
 
         # 2. VALIDITY - identifiers must match the registry format.
         invalid_id = ~df["nct_id"].fillna("").str.match(self.NCT_PATTERN)
-        record_metric("validity_nct_id_format", invalid_id, "INVALID_NCT_ID")
+        record_metric("validity_nct_id_format", invalid_id, "INVALID_NCT_ID", "FATAL")
 
         # 3. UNIQUENESS - the registry must never return the same trial twice.
         duplicated = df.duplicated(subset=["nct_id"], keep="first")
-        record_metric("uniqueness_nct_id", duplicated, "DUPLICATE_NCT_ID")
+        record_metric("uniqueness_nct_id", duplicated, "DUPLICATE_NCT_ID", "FATAL")
 
         # 4. ACCURACY - ages and enrollment must sit inside physically possible ranges.
         ages = pd.to_numeric(df["min_age_years"], errors="coerce")
@@ -587,30 +604,33 @@ class DataQualityEngine:
             | ((ages.notna()) & (max_ages.notna()) & (ages > max_ages))
             | (enrollment < 0)
         ).fillna(False)
-        record_metric("accuracy_numeric_ranges", impossible, "IMPOSSIBLE_NUMERIC_VALUE")
+        record_metric("accuracy_numeric_ranges", impossible, "IMPOSSIBLE_NUMERIC_VALUE", "FATAL")
 
-        # 5. CONSISTENCY - status vocabulary must match the registry's enumeration.
+        # 5. CONSISTENCY - status should match the registry's enumeration. The
+        # registry can add values, so an unrecognised one is reported, not fatal.
         inconsistent = ~df["overall_status"].fillna("").str.upper().isin(self.VALID_STATUSES)
-        record_metric("consistency_status_vocabulary", inconsistent, "UNKNOWN_STATUS_VALUE")
+        record_metric("consistency_status_vocabulary", inconsistent, "UNKNOWN_STATUS_VALUE", "ADVISORY")
 
-        # 6. TIMELINESS - a trial not updated in over five years is stale evidence.
+        # 6. TIMELINESS - a trial not updated in over five years is stale but
+        # still valid evidence, so the researcher is warned rather than denied it.
         cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=365 * 5)
         updated = pd.to_datetime(df["last_update"], errors="coerce", utc=True)
         stale = (updated.notna() & (updated < cutoff))
-        record_metric("timeliness_last_update", stale, "STALE_RECORD")
+        record_metric("timeliness_last_update", stale, "STALE_RECORD", "ADVISORY")
 
         for check in self.results["metrics"].values():
             if check["status"] == "FAILED":
                 self.results["passed_all_gates"] = False
 
-        df = df.assign(quality_failures=failures)
+        df = df.assign(quality_failures=fatal, data_quality_flags=advisory)
         clean = df[df["quality_failures"] == ""].drop(columns=["quality_failures"])
-        rejected = df[df["quality_failures"] != ""]
+        rejected = df[df["quality_failures"] != ""].drop(columns=["data_quality_flags"])
 
         ratio = len(rejected) / len(df) if len(df) else 0.0
         self.results["rejected_records"] = int(len(rejected))
         self.results["clean_records"] = int(len(clean))
-        self.results["failure_ratio"] = round(ratio, 4)
+        self.results["records_flagged_advisory"] = int((clean["data_quality_flags"] != "").sum())
+        self.results["fatal_failure_ratio"] = round(ratio, 4)
         self.results["halt_pipeline"] = ratio > settings.quality_halt_threshold
 
         return clean, rejected, self.results
@@ -1410,7 +1430,7 @@ class LLMClient:
             try:
                 from openai import OpenAI
 
-                self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+                self.client = OpenAI(base_url=settings.openrouter_base_url, api_key=api_key)
             except Exception as exc:
                 logger.warning(f"Could not initialise OpenRouter client ({exc}).")
         if self.client is None:
@@ -1557,6 +1577,8 @@ class ClinicalTrialRAG:
                 "rrf_score": round(candidate.get("rrf_score", 0.0), 6),
                 "rerank_score": round(candidate.get("rerank_score", 0.0), 4),
                 "source_url": candidate["metadata"].get("source_url"),
+                "quality_flags": candidate["metadata"].get("data_quality_flags") or "",
+                "last_update": candidate["metadata"].get("last_update") or "",
             }
             for index, candidate in enumerate(top, start=1)
         ]
@@ -1844,6 +1866,10 @@ def build_pipeline(allow_live: bool = True, reset_vectors: bool = True) -> Pipel
                 chunk["phase"] = record.get("phase")
                 chunk["min_age_years"] = record.get("min_age_years")
                 chunk["max_age_years"] = record.get("max_age_years")
+                chunk["last_update"] = record.get("last_update")
+                # Advisory quality findings travel with the chunk so the
+                # researcher sees them next to the evidence they qualify.
+                chunk["data_quality_flags"] = record.get("data_quality_flags") or ""
                 chunk["classification"] = "PUBLIC"
                 chunks.append(chunk)
 
@@ -1921,6 +1947,8 @@ def print_query_result(result: dict) -> None:
         print(f"       chunk   : {item['chunk_id']}")
         print(f"       lineage : {item['lineage_id']}")
         print(f"       source  : {item['source_url']}")
+        if item["quality_flags"]:
+            print(f"       ⚠ quality: {item['quality_flags']} (last updated {item['last_update']})")
 
     if result["contradiction_alerts"]:
         print("\n" + "-" * 70)
