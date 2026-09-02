@@ -1,0 +1,147 @@
+name: Build dataset from ClinicalTrials.gov
+
+# Runs the full platform on GitHub's own runners, so the real registry data and
+# the real embedding models can be exercised without installing anything locally.
+# Trigger it from the Actions tab: "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      condition:
+        description: "Medical condition to ingest from ClinicalTrials.gov"
+        required: false
+        default: "type 2 diabetes"
+      target_records:
+        description: "How many trials to pull"
+        required: false
+        default: "60"
+      commit_dataset:
+        description: "Commit the downloaded raw dataset back to the repository"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheels: same models, a fraction of the download.
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+            -r requirements.txt
+
+      - name: Show resolved versions
+        run: |
+          python --version
+          pip list | grep -Ei "torch|sentence-transformers|chromadb|pandas|httpx|rank-bm25" || true
+
+      - name: Run the pipeline against the live registry
+        env:
+          CTGOV_CONDITION: ${{ inputs.condition }}
+          CTGOV_TARGET_RECORDS: ${{ inputs.target_records }}
+        run: |
+          set -o pipefail
+          python clinical_trial_rag.py --stage pipeline 2>&1 | tee run-pipeline.txt
+
+      - name: Confirm the data came from the live registry
+        run: |
+          if grep -q "Ingestion mode = LIVE" run-pipeline.txt; then
+            echo "Live registry ingestion confirmed."
+          else
+            echo "::error::Ingestion did not run in LIVE mode - the registry was not reached."
+            grep -i "Ingestion mode" run-pipeline.txt || true
+            exit 1
+          fi
+
+      - name: Confirm the real embedding model loaded
+        run: |
+          if grep -q "hashing fallback" run-pipeline.txt; then
+            echo "::warning::The sentence-transformers model did not load; the offline embedder was used."
+          else
+            echo "Real embedding model loaded."
+          fi
+
+      - name: Lakehouse transaction log
+        run: python clinical_trial_rag.py --stage history 2>&1 | tee run-history.txt
+
+      - name: Data lineage
+        run: python clinical_trial_rag.py --stage lineage 2>&1 | tee run-lineage.txt
+
+      - name: Sample researcher query
+        run: |
+          set -o pipefail
+          python clinical_trial_rag.py --stage query \
+            --q "Which trials are recruiting adults over 60 with type 2 diabetes, and what are the age limits?" \
+            2>&1 | tee run-query.txt
+
+      - name: Governance demonstration
+        run: |
+          set -o pipefail
+          python clinical_trial_rag.py --stage audit --limit 3 2>&1 | tee run-audit.txt
+
+      - name: Summarise the run
+        if: always()
+        run: |
+          {
+            echo "## Pipeline run"
+            echo ""
+            echo '```'
+            grep -E "Ingestion mode|SUCCESS  \| Task|clean_records|rejected_records|CHUNK\+EMBED|VECTOR INDEX" run-pipeline.txt || true
+            echo '```'
+            echo ""
+            echo "## Lakehouse versions"
+            echo ""
+            echo '```'
+            tail -n 12 run-history.txt || true
+            echo '```'
+            echo ""
+            echo "## Sample query — RAG Triad"
+            echo ""
+            echo '```'
+            grep -A4 "RAG TRIAD" run-query.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: |
+            run-*.txt
+            pipeline_execution.log
+          retention-days: 30
+
+      - name: Commit the raw dataset
+        if: ${{ inputs.commit_dataset }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f data/landing_zone/ctgov_raw.json
+          if git diff --cached --quiet; then
+            echo "Dataset unchanged - nothing to commit."
+          else
+            RECORDS=$(python -c "import json;print(len(json.load(open('data/landing_zone/ctgov_raw.json'))))")
+            git commit -m "Add real ClinicalTrials.gov dataset (${RECORDS} studies, condition: ${{ inputs.condition }})
+
+          Downloaded from the ClinicalTrials.gov API v2 by the build-dataset
+          workflow. This is the untouched registry response, kept under version
+          control so the whole pipeline can be replayed offline with
+          --stage pipeline --offline."
+            git push
+          fi
