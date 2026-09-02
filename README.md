@@ -61,6 +61,7 @@ traceable back to a specific governed source passage. Three properties are non-n
                     +----------------------------------+
                     |          DATA SOURCES            |
                     |  ClinicalTrials.gov API v2       |
+                    |  PubMed (NCBI E-utilities)       |
                     |  Internal EHR (synthetic, PHI)   |
                     +----------------------------------+
                                      |
@@ -74,7 +75,14 @@ traceable back to a specific governed source passage. Three properties are non-n
                                      v
                     +----------------------------------+
                     |  DATA QUALITY GATE (Day 4)       |
-                    |  6 dimensions | quarantine zone  |
+                    |  6 dimensions x 2 sources        |
+                    |  FATAL / ADVISORY | quarantine   |
+                    +----------------------------------+
+                                     |
+                                     v
+                    +----------------------------------+
+                    |  FHIR R4 CONFORMANCE             |
+                    |  Patient | ResearchStudy         |
                     +----------------------------------+
                                      |
                                      v
@@ -95,7 +103,7 @@ traceable back to a specific governed source passage. Three properties are non-n
                     +----------------------------------+
                     |  CHUNKING + EMBEDDING (Day 3)    |
                     |  recursive chunking w/ overlap   |
-                    |  sentence-transformers, 384-dim  |
+                    |  biomedical sentence embeddings  |
                     +----------------------------------+
                                      |
                                      v
@@ -120,7 +128,7 @@ traceable back to a specific governed source passage. Three properties are non-n
                     |  RAG Triad | audit entry         |
                     +----------------------------------+
 
-        All six pipeline stages are scheduled by the ORCHESTRATION DAG (Day 5)
+        All seven pipeline stages are scheduled by the ORCHESTRATION DAG (Day 5)
         with dependency resolution, retries, exponential backoff, and fallbacks.
 ```
 
@@ -138,17 +146,19 @@ This is the mapping between the five training days and the implementation.
 | 1 | Time travel / transaction log | `DeltaStyleLakehouse.read(version=...)`, `.history()`, `_delta_log/` |
 | 1 | ELT — preserve raw forever | Raw API response cached to `data/landing_zone/ctgov_raw.json` before any transformation |
 | 2 | Event-driven architecture | `MockEventBroker` with `asyncio.Queue` topics |
-| 2 | Producers / Broker / Consumers | `ClinicalTrialsProducer`, `InternalEHRProducer`, `MockEventBroker.consume` |
+| 2 | Producers / Broker / Consumers | `ClinicalTrialsProducer`, `PubMedProducer`, `InternalEHRProducer` |
 | 2 | Decoupling & async ingestion | Producers publish without waiting for downstream consumers |
 | 2 | Ingestion → Transformation → Orchestration | The `ingest` → `quality` → … DAG in `build_pipeline` |
+| 2 | Multiple sources on one bus | `ClinicalTrialsProducer`, `PubMedProducer`, `InternalEHRProducer` |
 | 3 | Chunking (recursive + overlap) | `RecursiveChunker` |
-| 3 | Embeddings | `EmbeddingModel`, `HashingEmbedder` (offline fallback) |
+| 3 | Embeddings (biomedical) | `EmbeddingModel`, `HashingEmbedder` (offline fallback) |
 | 3 | Vector DB with HNSW / cosine | `VectorStore` (ChromaDB, `hnsw:space=cosine`) |
 | 3 | Hybrid retrieval + Reciprocal Rank Fusion | `HybridRetriever` (dense + BM25, `RRF_K=60`) |
 | 3 | Two-stage cross-encoder reranking | `CrossEncoderReranker`, `LexicalReranker` |
 | 3 | Incremental sync | Lakehouse initial load + delta append in the `lakehouse` task |
 | 3 | RAG Triad evaluation | `RAGTriadEvaluator` |
-| 4 | Six data quality dimensions | `DataQualityEngine.run_all_checks` |
+| 4 | Six data quality dimensions | `QualityEngineBase`, `DataQualityEngine`, `LiteratureQualityEngine` |
+| 4 | Healthcare interoperability | `FHIRValidator` — R4 `Patient` and `ResearchStudy` profiles |
 | 4 | Quality gate + quarantine | `quarantine_batch`, `halt_pipeline` threshold, FATAL vs ADVISORY severity |
 | 4 | Data classification taxonomy | `DATA_CLASSIFICATION` |
 | 4 | ABAC / principle of least privilege | `ROLE_POLICIES`, `GovernanceEngine.apply_access_policy` |
@@ -165,18 +175,20 @@ This is the mapping between the five training days and the implementation.
 
 | Layer | Tool | Why this one |
 |---|---|---|
-| Ingestion | `httpx` + ClinicalTrials.gov **API v2** | Real, public, free, no API key. The registry is the authoritative source for trial data. |
+| Ingestion (trials) | `httpx` + ClinicalTrials.gov **API v2** | Real, public, free, no API key. The registry is the authoritative source for trial data. |
+| Ingestion (literature) | `httpx` + PubMed **E-utilities** | Trials say what a study intends to do; the literature says what studies have already found. Also public and key-free. |
+| Interoperability | `FHIRValidator` (in-file, R4 profiles) | Validating against FHIR is what lets the platform claim its records could cross a hospital boundary rather than only working in its own schema. |
 | Streaming | `asyncio.Queue` broker | Models Kafka/Redpanda semantics (topics, immutable append, decoupled consumers) without needing a cluster on a laptop. |
 | Quality | `pandas` + custom `DataQualityEngine` | Vectorised checks over the batch; the same shape as a Great Expectations suite, but readable in one screen. |
 | Storage | Parquet + JSON transaction log | Delta Lake semantics (ACID, schema enforcement, time travel) with no JVM dependency, so the demo never fails on a Java version mismatch. See the note below. |
-| Embeddings | `sentence-transformers` / `all-MiniLM-L6-v2` | The model recommended in the Day 5 tech stack. 384 dimensions is the right trade-off between quality and speed for a corpus of this size. |
+| Embeddings | `sentence-transformers` / `NeuML/pubmedbert-base-embeddings` | Clinical language — HbA1c, eGFR, albuminuria — sits outside a general model's training distribution. See the note on ClinicalBERT below. |
 | Vector DB | **ChromaDB** with HNSW + cosine | Day 3's decision tree: high recall needed and RAM is available → HNSW. Cosine, because document length must not dominate the score. |
 | Sparse retrieval | `rank-bm25` | Vector search alone is blind to exact tokens like `NCT04223752`, `HbA1c`, `SGLT2`. BM25 covers exactly that gap. |
 | Reranking | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Required by the Day 5 brief for Idea 2. Mitigates the "lost-in-the-middle" problem by cutting 50 candidates down to the best 5. |
 | LLM | OpenRouter (OpenAI-compatible) | Same interface used in the Day 3 lab, so the model is swappable via one environment variable. |
 | Logging | `loguru` | Same logger used in the Day 4 lab; writes both to console and to `pipeline_execution.log`. |
 
-**Two deliberate substitutions, and the reasoning:**
+**Four deliberate substitutions, and the reasoning:**
 
 - **Delta Lake → a Delta-style log implemented in-file.** The Day 1 lab uses `delta-spark`,
   which needs Spark and a matching JVM. Keeping the capstone a single dependency-light file
@@ -187,6 +199,19 @@ This is the mapping between the five training days and the implementation.
 - **Qdrant → ChromaDB.** The Day 5 brief suggests Qdrant for Idea 2; the Day 5 recommended
   stack table also lists ChromaDB, and Chroma is what Day 3 taught. Both use HNSW, so the
   retrieval architecture is unchanged. Chroma runs embedded with no server to start.
+- **ClinicalBERT → a PubMedBERT sentence-embedding model.** The brief asks for ClinicalBERT
+  embeddings. ClinicalBERT itself is a masked-language-model checkpoint: its raw output was
+  never trained so that semantically similar sentences land near each other, so using it
+  directly for similarity search retrieves *worse* than a general model that was trained for
+  it. `NeuML/pubmedbert-base-embeddings` keeps the biomedical vocabulary — the whole point of
+  the request — while producing a space where cosine distance actually means semantic
+  distance. Set `EMBED_MODEL_NAME` to substitute any other model.
+- **Spark batch processing → pandas.** The brief lists Spark. Spark needs a JVM and a matching
+  Java version, which breaks the single-file, dependency-light constraint the same brief sets
+  two slides earlier, and is the most likely thing to fail on a reviewer's machine. At this
+  corpus size Spark would also be slower than pandas, not faster. The distributed-processing
+  concepts it teaches — partitioned writes, immutable commits, schema-on-write — are all
+  present in the lakehouse layer; only the engine differs.
 
 ---
 
@@ -276,10 +301,11 @@ Look for this line — it confirms the data came from the live registry:
 
 ### Where the dataset lives — أين تُحفظ البيانات
 
-The pipeline writes the untouched registry response to:
+The pipeline writes the untouched source responses to:
 
 ```
-data/landing_zone/ctgov_raw.json
+data/landing_zone/ctgov_raw.json     # ClinicalTrials.gov registry response
+data/landing_zone/pubmed_raw.xml     # PubMed EFetch response
 ```
 
 **You do not create this file or place it anywhere by hand.** It is written automatically the
@@ -337,7 +363,7 @@ python clinical_trial_rag.py --stage audit      # who queried what, and when
 
 | Flag | Meaning |
 |---|---|
-| `--offline` | Skip the live registry call and replay the cached raw JSON |
+| `--offline` | Skip the live source calls and replay the cached raw data |
 | `--role` | ABAC role: `clinical_researcher`, `treating_physician`, `data_engineer`, `public` |
 | `--actor` | Identity recorded in the audit trail |
 | `--limit` | Number of audit entries to display |
@@ -417,7 +443,16 @@ uv run clinical_trial_rag.py --stage demo
    to cover exact-token queries, and structured eligibility facts inlined into the eligibility
    chunks so those chunks became genuinely self-contained. Cross-encoder reranking was then
    added as a second stage.
-6. **Wired it all into an orchestration DAG** with dependency resolution, retries with
+6. **Closed the gaps against the project brief.** Re-reading the Day 5 specification for
+   this project idea surfaced three requirements the first build had skipped. A second real
+   source, PubMed, was added through the same broker with the same three-tier resilience — and
+   given its own quality gate, because the six dimensions land on different fields for an
+   article than for a trial and reusing the trial checks would have quietly passed everything.
+   A FHIR R4 conformance layer was added, mapping patients to `Patient` and trials to
+   `ResearchStudy` resources; it immediately caught a gender code outside the bound value set
+   and a malformed e-mail in the EHR records. And the embedding model was moved to a
+   biomedical one, for the reasons in the substitutions section above.
+7. **Wired it all into an orchestration DAG** with dependency resolution, retries with
    exponential backoff, and per-component fallbacks, then added the RAG Triad so any future
    change to the architecture can be measured rather than guessed at.
 
@@ -454,12 +489,14 @@ governance layer has something real to detect and block. No real person is repre
 
 data/
 ├── landing_zone/
-│   └── ctgov_raw.json      # THE DATASET — raw registry response, version-controlled
+│   ├── ctgov_raw.json      # THE DATASET — raw registry response, version-controlled
+│   └── pubmed_raw.xml      # raw PubMed response
 ├── quarantine_zone/        # records rejected by the quality gate      (regenerated)
 ├── lakehouse/                                                          (regenerated)
-│   └── clinical_trials/
-│       ├── _delta_log/     # immutable numbered commits
-│       └── data/           # parquet files, one per version
+│   ├── clinical_trials/    # trials — its own pinned schema
+│   │   ├── _delta_log/     # immutable numbered commits
+│   │   └── data/           # parquet files, one per version
+│   └── literature/         # articles — a separate table, separate schema
 ├── governance/                                                         (regenerated)
 │   ├── lineage.jsonl       # end-to-end data genealogy
 │   └── audit_trail.jsonl   # every query, append-only
