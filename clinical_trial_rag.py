@@ -1590,12 +1590,24 @@ class RecursiveChunker:
         # them the chunk is not self-contained: a question about age limits would
         # never retrieve the passage that actually answers it, because the numbers
         # live in a metadata column rather than in the free text.
-        min_age, max_age = record.get("min_age_years"), record.get("max_age_years")
+        # A missing number arrives from the lakehouse as NaN, not None, and NaN
+        # is not None - so an "is not None" test lets the literal text "nan"
+        # into the chunk, which is then what the researcher reads back.
+        def number_or(value, absent: str) -> str:
+            if value is None:
+                return absent
+            try:
+                if math.isnan(float(value)):
+                    return absent
+                return f"{float(value):g}"
+            except (TypeError, ValueError):
+                return str(value)
+
         eligibility_facts = (
-            f"Eligible ages: {min_age if min_age is not None else 'unspecified'} to "
-            f"{max_age if max_age is not None else 'no upper limit'} years. "
+            f"Eligible ages: {number_or(record.get('min_age_years'), 'unspecified')} to "
+            f"{number_or(record.get('max_age_years'), 'no upper limit')} years. "
             f"Sex eligible: {record.get('sex') or 'unspecified'}. "
-            f"Enrollment target: {record.get('enrollment') or 'unspecified'}.\n"
+            f"Enrollment target: {number_or(record.get('enrollment'), 'unspecified')}.\n"
         )
 
         sections = {
@@ -1704,7 +1716,13 @@ class EmbeddingModel:
             from sentence_transformers import SentenceTransformer
 
             self.model = SentenceTransformer(model_name)
-            self.dimensions = self.model.get_sentence_embedding_dimension()
+            # Renamed in newer sentence-transformers; the old name still works
+            # but warns, and a warning in the middle of a demo reads as a fault.
+            self.dimensions = (
+                self.model.get_embedding_dimension()
+                if hasattr(self.model, "get_embedding_dimension")
+                else self.model.get_sentence_embedding_dimension()
+            )
             logger.info(f"Embedding backend: {model_name} ({self.dimensions}-dim)")
         except Exception as exc:
             logger.warning(f"Could not load '{model_name}' ({type(exc).__name__}). Using hashing fallback.")
