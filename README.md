@@ -123,7 +123,7 @@ This is the mapping between the five training days and the implementation.
 | 3 | Incremental sync | Lakehouse initial load + delta append in the `lakehouse` task |
 | 3 | RAG Triad evaluation | `RAGTriadEvaluator` |
 | 4 | Six data quality dimensions | `DataQualityEngine.run_all_checks` |
-| 4 | Quality gate + quarantine | `quarantine_batch`, `halt_pipeline` threshold |
+| 4 | Quality gate + quarantine | `quarantine_batch`, `halt_pipeline` threshold, FATAL vs ADVISORY severity |
 | 4 | Data classification taxonomy | `DATA_CLASSIFICATION` |
 | 4 | ABAC / principle of least privilege | `ROLE_POLICIES`, `GovernanceEngine.apply_access_policy` |
 | 4 | HIPAA PHI detection & de-identification | `PHIGuard` |
@@ -332,9 +332,16 @@ uv run clinical_trial_rag.py --stage demo
    real ClinicalTrials.gov API v2 and caches the untouched response in a landing zone — the ELT
    principle that raw data is preserved forever so any transformation can be replayed.
 2. **Added the quality gate before anything downstream.** Real registry data has missing
-   summaries, stale entries, and inconsistent status vocabularies. Six dimensions are checked;
-   failing records are quarantined with a reason code, and a batch failing more than 30% halts
-   the pipeline entirely on the assumption that the upstream system is broken.
+   summaries, stale entries, and inconsistent status vocabularies. Six dimensions are checked.
+   The first version quarantined every violation equally — and testing it against a realistic
+   registry response showed why that was wrong: more than half the batch was rejected, mostly
+   for being *old*, and the pipeline halted. But a completed trial from 2017 is still valid
+   evidence; it is simply stale. Violations were therefore split by severity. **FATAL** findings
+   (no identifier, malformed NCT ID, duplicate, impossible ages) mean the record cannot be
+   trusted or cited, so it is quarantined. **ADVISORY** findings (no brief summary, unrecognised
+   status value, not updated in five years) travel with the record as a flag and surface in the
+   evidence trail beside the passage they qualify. Only fatal violations count towards the 30%
+   threshold that halts the pipeline on the assumption that the upstream system is broken.
 3. **Layered governance on top.** Every field was given a classification, PHI detection was
    written against the HIPAA identifier families, and every pipeline operation started emitting
    a lineage node and an audit entry.
