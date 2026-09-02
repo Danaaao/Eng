@@ -1,6 +1,10 @@
 # Healthcare Clinical Trial Matcher
+### مُطابِق التجارب السريرية
 
-**SDAIA — Modern Data Engineering for AI Systems | Day 5 Capstone Project**
+**Capstone project — Day 5**
+Course: *Modern Data Engineering for AI Systems* · هندسة البيانات الحديثة لأنظمة الذكاء الاصطناعي
+Programme: **[SDAIA — Saudi Data & AI Authority](https://github.com/SDAIA)** · الهيئة السعودية للبيانات والذكاء الاصطناعي
+Course reference: `SDAIA-F-CRS-100-01-V1`
 
 An integrated, production-simulated AI data platform that ingests real clinical trial
 records from **ClinicalTrials.gov**, governs them under **HIPAA** rules, stores them in a
@@ -9,6 +13,28 @@ questions through an **advanced RAG pipeline** — with an evidence trail, contr
 alerts, and an audit entry for every single query.
 
 The entire platform is one Python file: [`clinical_trial_rag.py`](clinical_trial_rag.py).
+
+---
+
+## نبذة عن المشروع
+
+نظام بيانات متكامل يدمج كل ما تم تدريسه في الأيام الخمسة من الدورة في معمارية واحدة:
+
+| اليوم | المفهوم | ما ينفّذه المشروع |
+|---|---|---|
+| ١ | معماريات البيانات الحديثة | مستودع بحيرة (Lakehouse) بخصائص ACID، وفرض المخطط، والسفر عبر الزمن |
+| ٢ | خطوط البيانات اللحظية | معمارية مدفوعة بالأحداث: منتجون ← وسيط ← مستهلكون، غير متزامنة |
+| ٣ | قواعد البيانات المتجهية و RAG المتقدم | تقطيع، تضمينات، بحث هجين + إعادة ترتيب، تقييم ثلاثي |
+| ٤ | جودة البيانات والحوكمة والنَّسَب | بوابة جودة، حماية البيانات الصحية (HIPAA)، تتبع النَّسَب، سجل تدقيق |
+| ٥ | التكامل المعماري | تنسيق كل ما سبق في مخطط تنفيذ واحد (DAG) |
+
+**الفكرة:** الباحث الطبي يسأل سؤالاً بلغة طبيعية عن التجارب السريرية المناسبة لحالة مريض،
+فيجيبه النظام بإجابة **مؤسَّسة على بيانات حقيقية موثَّقة**، مع **مسار أدلة** يربط كل معلومة
+بمصدرها، و**تنبيهات تعارض** عند اختلاف البيانات المهيكلة عن النص، **دون أن تخرج أي بيانات
+مريض محمية (PHI) من النطاق الآمن**، ومع تسجيل كل استعلام في سجل تدقيق غير قابل للتعديل.
+
+المشروع كله في **ملف بايثون واحد** كما يقتضي تكليف اليوم الخامس، ويعتمد على **بيانات حقيقية**
+من السجل الأمريكي العام للتجارب السريرية `ClinicalTrials.gov`.
 
 ---
 
@@ -221,8 +247,8 @@ comes from in a real hospital. Three controls apply:
 ### Setup
 
 ```bash
-git clone https://github.com/danaaao/eng.git
-cd eng
+git clone https://github.com/Danaaao/Eng.git
+cd Eng
 
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
@@ -242,8 +268,45 @@ python clinical_trial_rag.py --stage pipeline
 ```
 
 This runs the full DAG: ingest → quality → governance → lakehouse → chunk_embed → vector_index.
-The raw API response is cached to `data/landing_zone/ctgov_raw.json` so later runs can replay
-it offline with `--offline`.
+Look for this line — it confirms the data came from the live registry:
+
+```
+📥 [PRODUCER: ClinicalTrials.gov] Ingestion mode = LIVE | 60 studies
+```
+
+### Where the dataset lives — أين تُحفظ البيانات
+
+The pipeline writes the untouched registry response to:
+
+```
+data/landing_zone/ctgov_raw.json
+```
+
+**You do not create this file or place it anywhere by hand.** It is written automatically the
+first time `--stage pipeline` runs against the live registry. That path is the platform's
+*landing zone*, and the file is the dataset: the raw JSON exactly as ClinicalTrials.gov
+returned it, before any cleaning, validation, or transformation.
+
+Everything else under `data/` is derived from it and is regenerated on every run — the
+lakehouse commits, the vector index, the quarantine zone, the lineage and audit logs. Only the
+raw file is kept under version control, so commit it after your first live run:
+
+```bash
+git add data/landing_zone/ctgov_raw.json
+git commit -m "Add real ClinicalTrials.gov dataset"
+git push origin main
+```
+
+Once it is committed, anyone can rebuild the entire platform on your exact data with no
+network access at all:
+
+```bash
+python clinical_trial_rag.py --stage pipeline --offline    # Ingestion mode = REPLAY
+```
+
+This is the **ELT principle** from Day 1 made concrete: raw data is preserved permanently, and
+every transformation is re-run against it rather than replacing it. It is also what makes the
+project reproducible for whoever evaluates it.
 
 ### Ask a question
 
@@ -389,16 +452,21 @@ governance layer has something real to detect and block. No real person is repre
 ├── .gitignore
 └── README.md
 
-Created at runtime:
 data/
-├── landing_zone/           # raw ClinicalTrials.gov response (ELT: raw preserved)
-├── quarantine_zone/        # records rejected by the quality gate
-├── lakehouse/
+├── landing_zone/
+│   └── ctgov_raw.json      # THE DATASET — raw registry response, version-controlled
+├── quarantine_zone/        # records rejected by the quality gate      (regenerated)
+├── lakehouse/                                                          (regenerated)
 │   └── clinical_trials/
 │       ├── _delta_log/     # immutable numbered commits
 │       └── data/           # parquet files, one per version
-├── governance/
+├── governance/                                                         (regenerated)
 │   ├── lineage.jsonl       # end-to-end data genealogy
 │   └── audit_trail.jsonl   # every query, append-only
-└── chroma_db/              # persistent vector index
+└── chroma_db/              # persistent vector index                   (regenerated)
 ```
+
+Only `data/landing_zone/ctgov_raw.json` is committed. Everything marked *(regenerated)* is
+derived from it and rebuilt by `--stage pipeline`, so it is deliberately excluded from version
+control — a derived artefact in a repository goes stale and starts lying about what the code
+produces.
