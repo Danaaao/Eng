@@ -3,7 +3,7 @@
 
 **Capstone project — Day 5**
 Course: *Modern Data Engineering for AI Systems* · هندسة البيانات الحديثة لأنظمة الذكاء الاصطناعي
-Programme: **[SDAIA — Saudi Data & AI Authority](https://github.com/SDAIA)** · الهيئة السعودية للبيانات والذكاء الاصطناعي
+Programme: **[SDAIA Academy](https://github.com/SDAIAAcademy)** · أكاديمية سدايا
 Course reference: `SDAIA-F-CRS-100-01-V1`
 
 An integrated, production-simulated AI data platform that ingests real clinical trial
@@ -507,3 +507,7 @@ Only `data/landing_zone/ctgov_raw.json` is committed. Everything marked *(regene
 derived from it and rebuilt by `--stage pipeline`, so it is deliberately excluded from version
 control — a derived artefact in a repository goes stale and starts lying about what the code
 produces.
+
+---
+
+This project was made for "Modern Data Engineering for AI Systems" course provided by [SDAIA Academy](https://github.com/SDAIAAcademy).
