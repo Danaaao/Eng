@@ -138,8 +138,8 @@ jobs:
       - name: Commit the raw dataset
         if: ${{ inputs.commit_dataset }}
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "Danaaao"
+          git config user.email "danawaelalhelal@gmail.com"
           git add -f data/landing_zone/ctgov_raw.json data/landing_zone/pubmed_raw.xml
           if git diff --cached --quiet; then
             echo "Dataset unchanged - nothing to commit."
